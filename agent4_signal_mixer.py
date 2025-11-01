@@ -1,636 +1,977 @@
-#!/usr/bin/env python3
 """
-Agent 4: Signal Mixer
-Integrates outputs from all agents into coherent trading signals and decisions
+Gnosis Agent 4: Advanced Signal Mixer
+Complete implementation for multi-agent signal integration with conviction scoring
 """
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple, Optional, Union
-from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional, Any, Union
+from dataclasses import dataclass, field
 from enum import Enum
 import logging
+import asyncio
+import json
+from scipy import stats
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+import warnings
 
-# Import other agents (optional imports for testing)
-try:
-    from dhpe_engine import DHPEEngine, DHPEMetrics
-    from agent2_advanced_liquidity import AdvancedLiquidityAnalyzer  
-    from agent3_sentiment import Agent3SentimentInterpreter, MarketRegime
-    from agent1_hedge import Agent1HedgeEngine, HedgeRecommendation, RiskLevel
-except ImportError:
-    # Create mock classes for standalone testing
-    class DHPEMetrics:
-        def __init__(self, **kwargs):
-            for k, v in kwargs.items():
-                setattr(self, k, v)
-    
-    class MarketRegime(Enum):
-        BULL_EXTREME = "BULL_EXTREME"
-        BULL_STRONG = "BULL_STRONG"
-        BULL_MODERATE = "BULL_MODERATE"
-        NEUTRAL = "NEUTRAL"
-        BEAR_MODERATE = "BEAR_MODERATE"
-        BEAR_STRONG = "BEAR_STRONG"
-        BEAR_EXTREME = "BEAR_EXTREME"
-    
-    class RiskLevel(Enum):
-        LOW = "LOW"
-        MODERATE = "MODERATE"
-        HIGH = "HIGH"
-        EXTREME = "EXTREME"
-    
-    class HedgeRecommendation:
-        pass
+warnings.filterwarnings('ignore')
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class SignalStrength(Enum):
-    """Signal strength classifications"""
-    VERY_WEAK = "VERY_WEAK"
-    WEAK = "WEAK" 
-    MODERATE = "MODERATE"
-    STRONG = "STRONG"
-    VERY_STRONG = "VERY_STRONG"
+class SignalType(Enum):
+    """Types of trading signals"""
+    BUY = "buy"
+    SELL = "sell"
+    HOLD = "hold"
+    HEDGE = "hedge"
+    REDUCE = "reduce"
+    INCREASE = "increase"
 
-class TradeDirection(Enum):
-    """Trading direction recommendations"""
-    STRONG_BEARISH = "STRONG_BEARISH"
-    BEARISH = "BEARISH"
-    NEUTRAL = "NEUTRAL"
-    BULLISH = "BULLISH"
-    STRONG_BULLISH = "STRONG_BULLISH"
-
-class StrategyType(Enum):
-    """Recommended strategy types"""
-    DIRECTIONAL_LONG = "DIRECTIONAL_LONG"
-    DIRECTIONAL_SHORT = "DIRECTIONAL_SHORT"
-    VOLATILITY_EXPANSION = "VOLATILITY_EXPANSION"
-    VOLATILITY_CONTRACTION = "VOLATILITY_CONTRACTION"
-    INCOME_GENERATION = "INCOME_GENERATION"
-    HEDGE_EXISTING = "HEDGE_EXISTING"
-    CASH = "CASH"
+class ConfidenceLevel(Enum):
+    """Signal confidence levels"""
+    VERY_LOW = "very_low"
+    LOW = "low" 
+    MEDIUM = "medium"
+    HIGH = "high"
+    VERY_HIGH = "very_high"
 
 @dataclass
 class AgentSignal:
-    """Individual agent signal contribution"""
+    """Individual agent signal structure"""
+    agent_id: str
     agent_name: str
-    signal_strength: float  # -1.0 to +1.0
-    confidence: float      # 0.0 to 1.0
-    direction: TradeDirection
-    reasoning: str
-    weight: float          # Agent weight in final decision
+    signal_type: SignalType
+    strength: float  # 0.0 to 1.0
+    confidence: float  # 0.0 to 1.0
     timestamp: datetime
+    symbol: str
+    reasoning: str
+    supporting_data: Dict[str, Any] = field(default_factory=dict)
+    weight: float = 1.0  # Agent weight in ensemble
+    
+    def __post_init__(self):
+        # Validate ranges
+        self.strength = max(0.0, min(1.0, self.strength))
+        self.confidence = max(0.0, min(1.0, self.confidence))
+        self.weight = max(0.0, min(1.0, self.weight))
 
 @dataclass
-class IntegratedSignal:
-    """Final integrated signal from all agents"""
-    direction: TradeDirection
-    strength: SignalStrength
-    confidence: float
-    strategy_recommendation: StrategyType
-    
-    # Agent contributions
-    dhpe_signal: AgentSignal
-    liquidity_signal: AgentSignal
-    sentiment_signal: AgentSignal
-    risk_signal: AgentSignal
-    
-    # Meta information
-    signal_agreement: float  # How much agents agree (0-1)
-    conviction_score: float  # Overall conviction (0-1)
-    risk_adjusted_confidence: float
-    
-    # Actionable recommendations
-    entry_triggers: List[str]
-    exit_triggers: List[str]
-    position_size_modifier: float  # 0.5 = half size, 2.0 = double size
-    
-    timestamp: datetime
+class MixedSignal:
+    """Final mixed signal output"""
+    symbol: str
+    signal_type: SignalType
+    strength: float
+    confidence: ConfidenceLevel
+    conviction_score: float
+    contributing_agents: List[str]
+    consensus_level: float
+    risk_reward_ratio: float
+    timestamp: datetime = field(default_factory=datetime.now)
+    execution_priority: str = "medium"
+    supporting_analysis: Dict[str, Any] = field(default_factory=dict)
 
-class Agent4SignalMixer:
-    """
-    Agent 4: Signal Integration and Decision Making
+class SignalWeight:
+    """Dynamic agent weight calculation"""
     
-    Combines outputs from:
-    - DHPE Engine (gamma exposure, hedge pressure)
-    - Agent 2 (liquidity analysis)  
-    - Agent 3 (sentiment classification)
-    - Agent 1 (risk management, hedging)
-    
-    Produces integrated trading signals with confidence levels
-    """
-    
-    def __init__(self, base_account_size: float = 100000):
-        """Initialize signal mixer"""
-        self.account_size = base_account_size
-        self.signal_history: List[IntegratedSignal] = []
+    def __init__(self):
+        self.performance_history = {}
+        self.recent_accuracy = {}
+        self.correlation_matrix = {}
         
-        # Agent weights (must sum to 1.0)
-        self.agent_weights = {
-            'dhpe': 0.35,      # DHPE gets highest weight (market structure)
-            'sentiment': 0.25,  # Sentiment regime important
-            'liquidity': 0.25,  # Liquidity flows critical
-            'risk': 0.15       # Risk management overlay
-        }
+    def calculate_performance_weight(self, agent_id: str, recent_signals: List[AgentSignal], 
+                                   market_outcomes: List[float]) -> float:
+        """Calculate weight based on historical performance"""
         
-        # Signal filtering parameters
-        self.min_confidence_threshold = 0.4  # Minimum confidence to act
-        self.agreement_threshold = 0.6       # Minimum agent agreement
-        self.conviction_threshold = 0.5      # Minimum conviction to recommend
-        
-        # Position sizing parameters
-        self.base_position_size = 0.02  # 2% of account per trade
-        self.max_position_size = 0.05   # 5% maximum
-        
-        logger.info("Agent 4 Signal Mixer initialized")
-    
-    def process_dhpe_signal(self, dhpe_metrics: DHPEMetrics, spot_price: float) -> AgentSignal:
-        """Convert DHPE metrics to signal"""
-        
-        # Dealer positioning analysis
-        dealer_pos = dhpe_metrics.dealer_positioning
-        hedge_pressure = dhpe_metrics.hedge_pressure_score
-        
-        # Distance from max pain creates directional bias
-        max_pain_distance = (spot_price - dhpe_metrics.max_pain_strike) / spot_price
-        
-        # Signal strength based on hedge pressure and positioning
-        if dealer_pos < -0.5 and hedge_pressure > 0.7:
-            # Dealers short gamma + high pressure = strong bullish
-            signal_strength = 0.8 + min(0.2, hedge_pressure - 0.7)
-            direction = TradeDirection.STRONG_BULLISH
-            reasoning = f"Dealers short gamma (δ={dealer_pos:.2f}) with extreme hedge pressure"
-        elif dealer_pos < -0.2 and hedge_pressure > 0.5:
-            signal_strength = 0.4 + (hedge_pressure - 0.5) * 0.8
-            direction = TradeDirection.BULLISH  
-            reasoning = f"Moderate dealer short gamma with elevated hedge pressure"
-        elif dealer_pos > 0.5 and hedge_pressure > 0.7:
-            # Dealers long gamma + high pressure = strong bearish
-            signal_strength = -(0.8 + min(0.2, hedge_pressure - 0.7))
-            direction = TradeDirection.STRONG_BEARISH
-            reasoning = f"Dealers long gamma (δ={dealer_pos:.2f}) with extreme hedge pressure"
-        elif dealer_pos > 0.2 and hedge_pressure > 0.5:
-            signal_strength = -(0.4 + (hedge_pressure - 0.5) * 0.8)
-            direction = TradeDirection.BEARISH
-            reasoning = f"Moderate dealer long gamma with elevated hedge pressure"
-        else:
-            # Neutral conditions
-            signal_strength = max_pain_distance * 0.3  # Weak bias toward max pain
-            direction = TradeDirection.NEUTRAL
-            reasoning = f"Balanced dealer positioning, max pain influence"
-        
-        # Confidence based on data quality and pressure levels
-        confidence = min(0.95, 0.5 + hedge_pressure * 0.5)
-        
-        return AgentSignal(
-            agent_name="DHPE",
-            signal_strength=signal_strength,
-            confidence=confidence,
-            direction=direction,
-            reasoning=reasoning,
-            weight=self.agent_weights['dhpe'],
-            timestamp=datetime.now()
-        )
-    
-    def process_sentiment_signal(self, regime: MarketRegime, regime_confidence: float, 
-                               bias_scores: Dict[str, float]) -> AgentSignal:
-        """Convert sentiment analysis to signal"""
-        
-        # Map regime to signal strength
-        regime_mapping = {
-            MarketRegime.BULL_EXTREME: (0.9, TradeDirection.STRONG_BULLISH),
-            MarketRegime.BULL_STRONG: (0.7, TradeDirection.STRONG_BULLISH),
-            MarketRegime.BULL_MODERATE: (0.4, TradeDirection.BULLISH),
-            MarketRegime.NEUTRAL: (0.0, TradeDirection.NEUTRAL),
-            MarketRegime.BEAR_MODERATE: (-0.4, TradeDirection.BEARISH),
-            MarketRegime.BEAR_STRONG: (-0.7, TradeDirection.STRONG_BEARISH),
-            MarketRegime.BEAR_EXTREME: (-0.9, TradeDirection.STRONG_BEARISH)
-        }
-        
-        base_strength, direction = regime_mapping[regime]
-        
-        # Adjust for behavioral biases
-        herding_bias = bias_scores.get('herding', 0)
-        loss_aversion = bias_scores.get('loss_aversion', 0)
-        
-        # High herding amplifies signals
-        bias_multiplier = 1.0 + (herding_bias * 0.3)
-        
-        # Loss aversion creates asymmetric bearish bias
-        if base_strength < 0:
-            bias_multiplier *= (1.0 + loss_aversion * 0.2)
-        
-        signal_strength = base_strength * bias_multiplier
-        
-        # Confidence adjusted by regime stability
-        confidence = regime_confidence * (1.0 - herding_bias * 0.1)  # Herding reduces confidence
-        
-        reasoning = f"{regime.value} regime (conf:{regime_confidence:.2f}) with {herding_bias:.2f} herding bias"
-        
-        return AgentSignal(
-            agent_name="Sentiment",
-            signal_strength=np.clip(signal_strength, -1.0, 1.0),
-            confidence=confidence,
-            direction=direction,
-            reasoning=reasoning,
-            weight=self.agent_weights['sentiment'],
-            timestamp=datetime.now()
-        )
-    
-    def process_liquidity_signal(self, liquidity_metrics: Dict[str, float]) -> AgentSignal:
-        """Convert liquidity analysis to signal"""
-        
-        # Extract key liquidity metrics
-        vwap_deviation = liquidity_metrics.get('vwap_deviation', 0)
-        volume_profile_strength = liquidity_metrics.get('volume_profile_strength', 0.5)
-        aggressive_ratio = liquidity_metrics.get('aggressive_buy_ratio', 0.5)
-        
-        # VWAP deviation provides directional bias
-        vwap_signal = np.tanh(vwap_deviation * 5)  # Normalize to [-1, 1]
-        
-        # Aggressive buying/selling provides confirmation
-        aggression_signal = (aggressive_ratio - 0.5) * 2  # Convert to [-1, 1]
-        
-        # Combined signal
-        signal_strength = (vwap_signal * 0.6) + (aggression_signal * 0.4)
-        
-        # Direction mapping
-        if signal_strength > 0.5:
-            direction = TradeDirection.BULLISH
-        elif signal_strength > 0.2:
-            direction = TradeDirection.BULLISH
-        elif signal_strength < -0.5:
-            direction = TradeDirection.BEARISH
-        elif signal_strength < -0.2:
-            direction = TradeDirection.BEARISH
-        else:
-            direction = TradeDirection.NEUTRAL
-        
-        # Confidence based on volume profile strength
-        confidence = volume_profile_strength
-        
-        reasoning = f"VWAP dev:{vwap_deviation:.2%}, Aggressive ratio:{aggressive_ratio:.2f}"
-        
-        return AgentSignal(
-            agent_name="Liquidity",
-            signal_strength=signal_strength,
-            confidence=confidence,
-            direction=direction,
-            reasoning=reasoning,
-            weight=self.agent_weights['liquidity'],
-            timestamp=datetime.now()
-        )
-    
-    def process_risk_signal(self, risk_level: RiskLevel, hedge_recommendations: List[HedgeRecommendation],
-                          portfolio_delta: float) -> AgentSignal:
-        """Convert risk analysis to signal"""
-        
-        # Risk level affects position sizing and direction
-        risk_mapping = {
-            RiskLevel.LOW: 1.0,      # Full signal strength
-            RiskLevel.MODERATE: 0.7,  # Reduced strength
-            RiskLevel.HIGH: 0.4,      # Much reduced
-            RiskLevel.EXTREME: 0.1    # Minimal exposure
-        }
-        
-        risk_multiplier = risk_mapping[risk_level]
-        
-        # Portfolio delta creates directional bias for hedging
-        if abs(portfolio_delta) > 100:  # Significant exposure
-            if portfolio_delta > 0:
-                # Long delta - bearish signal for hedging
-                signal_strength = -min(0.8, abs(portfolio_delta) / 500)
-                direction = TradeDirection.BEARISH
-                reasoning = f"Long delta hedge: δ={portfolio_delta:.0f}, risk={risk_level.value}"
-            else:
-                # Short delta - bullish signal for hedging  
-                signal_strength = min(0.8, abs(portfolio_delta) / 500)
-                direction = TradeDirection.BULLISH
-                reasoning = f"Short delta hedge: δ={portfolio_delta:.0f}, risk={risk_level.value}"
-        else:
-            # Neutral delta
-            signal_strength = 0.0
-            direction = TradeDirection.NEUTRAL
-            reasoning = f"Balanced portfolio: δ={portfolio_delta:.0f}, risk={risk_level.value}"
-        
-        # Apply risk multiplier
-        signal_strength *= risk_multiplier
-        
-        # Confidence inversely related to risk level
-        confidence = 1.0 - (list(RiskLevel).index(risk_level) * 0.2)
-        
-        return AgentSignal(
-            agent_name="Risk",
-            signal_strength=signal_strength,
-            confidence=confidence,
-            direction=direction,
-            reasoning=reasoning,
-            weight=self.agent_weights['risk'],
-            timestamp=datetime.now()
-        )
-    
-    def calculate_signal_agreement(self, signals: List[AgentSignal]) -> float:
-        """Calculate agreement between agent signals"""
-        
-        signal_strengths = [s.signal_strength for s in signals]
-        
-        # All positive or all negative = high agreement
-        all_positive = all(s >= 0 for s in signal_strengths)
-        all_negative = all(s <= 0 for s in signal_strengths)
-        
-        if all_positive or all_negative:
-            # Calculate variance - lower variance = higher agreement
-            variance = np.var(signal_strengths)
-            agreement = max(0, 1.0 - variance)
-        else:
-            # Mixed signals - calculate how much they cancel out
-            positive_sum = sum(s for s in signal_strengths if s > 0)
-            negative_sum = abs(sum(s for s in signal_strengths if s < 0))
-            total_magnitude = positive_sum + negative_sum
+        if len(recent_signals) != len(market_outcomes) or len(recent_signals) == 0:
+            return 0.5  # Default neutral weight
             
-            if total_magnitude > 0:
-                agreement = 1.0 - (min(positive_sum, negative_sum) / total_magnitude)
-            else:
-                agreement = 0.5  # Neutral
+        # Calculate accuracy score
+        correct_predictions = 0
+        total_predictions = len(recent_signals)
         
-        return np.clip(agreement, 0.0, 1.0)
+        for signal, outcome in zip(recent_signals, market_outcomes):
+            # Simplified accuracy calculation
+            if signal.signal_type == SignalType.BUY and outcome > 0:
+                correct_predictions += 1
+            elif signal.signal_type == SignalType.SELL and outcome < 0:
+                correct_predictions += 1
+            elif signal.signal_type == SignalType.HOLD and abs(outcome) < 0.01:
+                correct_predictions += 1
+                
+        accuracy = correct_predictions / total_predictions
+        
+        # Weight based on accuracy with some randomness to prevent overfitting
+        base_weight = accuracy
+        confidence_adj = np.mean([s.confidence for s in recent_signals])
+        
+        final_weight = (base_weight * 0.7) + (confidence_adj * 0.3)
+        
+        self.recent_accuracy[agent_id] = accuracy
+        return max(0.1, min(0.9, final_weight))  # Keep within reasonable bounds
+        
+    def calculate_diversification_weight(self, agent_id: str, all_signals: List[AgentSignal]) -> float:
+        """Calculate weight based on signal diversification"""
+        
+        # Group signals by agent
+        agent_signals = {}
+        for signal in all_signals:
+            if signal.agent_id not in agent_signals:
+                agent_signals[signal.agent_id] = []
+            agent_signals[signal.agent_id].append(signal)
+            
+        if agent_id not in agent_signals or len(agent_signals[agent_id]) == 0:
+            return 0.5
+            
+        # Calculate correlation with other agents
+        target_strengths = [s.strength for s in agent_signals[agent_id]]
+        
+        correlations = []
+        for other_agent, other_signals in agent_signals.items():
+            if other_agent != agent_id and len(other_signals) > 0:
+                other_strengths = [s.strength for s in other_signals[:len(target_strengths)]]
+                
+                if len(other_strengths) == len(target_strengths) and len(target_strengths) > 1:
+                    corr, _ = stats.pearsonr(target_strengths, other_strengths)
+                    if not np.isnan(corr):
+                        correlations.append(abs(corr))
+                        
+        # Lower correlation = higher diversification value
+        avg_correlation = np.mean(correlations) if correlations else 0.5
+        diversification_weight = 1.0 - avg_correlation
+        
+        return max(0.2, min(0.8, diversification_weight))
+
+class ConvictionCalculator:
+    """Calculate conviction scores for mixed signals"""
     
-    def integrate_signals(self, dhpe_signal: AgentSignal, sentiment_signal: AgentSignal,
-                         liquidity_signal: AgentSignal, risk_signal: AgentSignal) -> IntegratedSignal:
-        """Integrate all agent signals into final recommendation"""
+    def __init__(self):
+        self.conviction_factors = {
+            'agreement': 0.3,      # How much agents agree
+            'confidence': 0.25,    # Average confidence level
+            'strength': 0.2,       # Signal strength
+            'diversity': 0.15,     # Source diversity
+            'timing': 0.1          # Timing consistency
+        }
         
-        signals = [dhpe_signal, sentiment_signal, liquidity_signal, risk_signal]
+    def calculate_conviction(self, signals: List[AgentSignal], mixed_signal: MixedSignal) -> float:
+        """Calculate overall conviction score"""
         
-        # Weighted average of signal strengths
-        weighted_strength = sum(s.signal_strength * s.weight for s in signals)
+        if not signals:
+            return 0.0
+            
+        # Agreement factor - how many agents agree on direction
+        same_direction = len([s for s in signals if s.signal_type == mixed_signal.signal_type])
+        agreement_score = same_direction / len(signals)
         
-        # Weighted confidence
-        weighted_confidence = sum(s.confidence * s.weight for s in signals)
+        # Confidence factor - average confidence
+        confidence_score = np.mean([s.confidence for s in signals])
         
-        # Signal agreement
-        agreement = self.calculate_signal_agreement(signals)
+        # Strength factor - weighted average strength
+        weights = [s.weight for s in signals]
+        strengths = [s.strength for s in signals]
+        strength_score = np.average(strengths, weights=weights)
         
-        # Overall conviction (confidence * agreement)
-        conviction = weighted_confidence * agreement
+        # Diversity factor - how many different agents
+        unique_agents = len(set(s.agent_id for s in signals))
+        max_possible_agents = 4  # DHPE, Liquidity, Sentiment, Hedge
+        diversity_score = min(1.0, unique_agents / max_possible_agents)
         
-        # Risk-adjusted confidence (reduced by risk signal)
-        risk_adjustment = 1.0 - max(0, -risk_signal.signal_strength) * 0.5
-        risk_adjusted_confidence = weighted_confidence * risk_adjustment
+        # Timing factor - how recent and synchronized the signals are
+        now = datetime.now()
+        ages = [(now - s.timestamp).total_seconds() / 3600 for s in signals]  # Hours
+        timing_score = max(0.0, 1.0 - (np.mean(ages) / 24))  # Decay over 24 hours
         
-        # Determine final direction
-        if weighted_strength > 0.6:
-            direction = TradeDirection.STRONG_BULLISH
-            strength = SignalStrength.VERY_STRONG if conviction > 0.8 else SignalStrength.STRONG
-        elif weighted_strength > 0.3:
-            direction = TradeDirection.BULLISH
-            strength = SignalStrength.STRONG if conviction > 0.7 else SignalStrength.MODERATE
-        elif weighted_strength < -0.6:
-            direction = TradeDirection.STRONG_BEARISH
-            strength = SignalStrength.VERY_STRONG if conviction > 0.8 else SignalStrength.STRONG
-        elif weighted_strength < -0.3:
-            direction = TradeDirection.BEARISH  
-            strength = SignalStrength.STRONG if conviction > 0.7 else SignalStrength.MODERATE
-        else:
-            direction = TradeDirection.NEUTRAL
-            strength = SignalStrength.WEAK
-        
-        # Strategy recommendation
-        strategy = self._determine_strategy(direction, strength, dhpe_signal, sentiment_signal)
-        
-        # Entry/exit triggers
-        entry_triggers = self._generate_entry_triggers(direction, signals)
-        exit_triggers = self._generate_exit_triggers(direction, conviction)
-        
-        # Position sizing
-        position_size_modifier = self._calculate_position_size(conviction, risk_adjusted_confidence)
-        
-        return IntegratedSignal(
-            direction=direction,
-            strength=strength,
-            confidence=weighted_confidence,
-            strategy_recommendation=strategy,
-            dhpe_signal=dhpe_signal,
-            liquidity_signal=liquidity_signal,
-            sentiment_signal=sentiment_signal,
-            risk_signal=risk_signal,
-            signal_agreement=agreement,
-            conviction_score=conviction,
-            risk_adjusted_confidence=risk_adjusted_confidence,
-            entry_triggers=entry_triggers,
-            exit_triggers=exit_triggers,
-            position_size_modifier=position_size_modifier,
-            timestamp=datetime.now()
+        # Combine all factors
+        conviction = (
+            agreement_score * self.conviction_factors['agreement'] +
+            confidence_score * self.conviction_factors['confidence'] +
+            strength_score * self.conviction_factors['strength'] +
+            diversity_score * self.conviction_factors['diversity'] +
+            timing_score * self.conviction_factors['timing']
         )
-    
-    def _determine_strategy(self, direction: TradeDirection, strength: SignalStrength,
-                          dhpe_signal: AgentSignal, sentiment_signal: AgentSignal) -> StrategyType:
-        """Determine recommended strategy type"""
         
-        if direction == TradeDirection.NEUTRAL or strength == SignalStrength.WEAK:
-            return StrategyType.CASH
+        return max(0.0, min(1.0, conviction))
         
-        # High conviction directional trades
-        if strength in [SignalStrength.STRONG, SignalStrength.VERY_STRONG]:
-            if direction in [TradeDirection.BULLISH, TradeDirection.STRONG_BULLISH]:
-                return StrategyType.DIRECTIONAL_LONG
-            else:
-                return StrategyType.DIRECTIONAL_SHORT
+    def calculate_risk_reward_ratio(self, signals: List[AgentSignal], 
+                                  market_data: Dict[str, Any]) -> float:
+        """Calculate estimated risk/reward ratio"""
         
-        # Volatility-based strategies for moderate signals
-        if dhpe_signal.signal_strength and abs(dhpe_signal.signal_strength) > 0.5:
-            # High hedge pressure suggests volatility
-            if direction in [TradeDirection.BULLISH, TradeDirection.STRONG_BULLISH]:
-                return StrategyType.VOLATILITY_EXPANSION
-            else:
-                return StrategyType.VOLATILITY_CONTRACTION
+        # Extract risk metrics from supporting data
+        risk_signals = []
+        reward_signals = []
         
-        # Income generation for moderate bullish
-        if direction == TradeDirection.BULLISH and strength == SignalStrength.MODERATE:
-            return StrategyType.INCOME_GENERATION
+        for signal in signals:
+            data = signal.supporting_data
+            
+            # Look for risk indicators
+            if 'var' in data or 'risk' in data:
+                risk_val = data.get('var', data.get('risk', 0))
+                if risk_val > 0:
+                    risk_signals.append(risk_val)
+                    
+            # Look for reward indicators  
+            if 'expected_return' in data or 'target' in data:
+                reward_val = data.get('expected_return', data.get('target', 0))
+                if reward_val != 0:
+                    reward_signals.append(abs(reward_val))
+                    
+        # Fallback to volatility-based estimate
+        current_price = market_data.get('price', 100)
+        volatility = market_data.get('volatility', 0.20)
         
-        return StrategyType.HEDGE_EXISTING
-    
-    def _generate_entry_triggers(self, direction: TradeDirection, signals: List[AgentSignal]) -> List[str]:
-        """Generate entry trigger conditions"""
+        estimated_risk = current_price * volatility * 0.1  # 10% of daily vol
+        estimated_reward = current_price * volatility * 0.15  # 15% of daily vol
         
-        triggers = []
-        
-        if direction in [TradeDirection.BULLISH, TradeDirection.STRONG_BULLISH]:
-            triggers.append("Price breaks above VWAP with volume")
-            triggers.append("RSI moves above 50 with momentum")
-            if any(s.agent_name == "DHPE" and s.confidence > 0.7 for s in signals):
-                triggers.append("Hedge pressure remains elevated")
-        
-        elif direction in [TradeDirection.BEARISH, TradeDirection.STRONG_BEARISH]:
-            triggers.append("Price breaks below VWAP with volume")
-            triggers.append("RSI moves below 50 with momentum")
-            if any(s.agent_name == "DHPE" and s.confidence > 0.7 for s in signals):
-                triggers.append("Dealer positioning shifts")
-        
+        if risk_signals:
+            estimated_risk = np.mean(risk_signals)
+        if reward_signals:
+            estimated_reward = np.mean(reward_signals)
+            
+        if estimated_risk > 0:
+            return estimated_reward / estimated_risk
         else:
-            triggers.append("Wait for clearer directional signals")
-        
-        return triggers
-    
-    def _generate_exit_triggers(self, direction: TradeDirection, conviction: float) -> List[str]:
-        """Generate exit trigger conditions"""
-        
-        triggers = []
-        
-        # Standard stops
-        triggers.append(f"Stop loss: {2.0 / max(conviction, 0.3):.1f}% adverse move")
-        triggers.append(f"Profit target: {conviction * 5:.1f}% favorable move")
-        
-        # Time-based exits
-        if conviction < 0.6:
-            triggers.append("Time stop: 2-3 days max hold")
-        else:
-            triggers.append("Time stop: 5-7 days max hold")
-        
-        # Signal-based exits
-        triggers.append("Agent signal reversal (2+ agents flip)")
-        triggers.append("DHPE regime change")
-        
-        return triggers
-    
-    def _calculate_position_size(self, conviction: float, risk_adjusted_confidence: float) -> float:
-        """Calculate position size multiplier"""
-        
-        # Base size modified by conviction and risk
-        base_multiplier = conviction * risk_adjusted_confidence
-        
-        # Scale to reasonable range
-        position_multiplier = 0.5 + (base_multiplier * 1.5)  # 0.5x to 2.0x
-        
-        # Cap at maximum
-        return min(position_multiplier, 2.0)
-    
-    def get_integrated_analysis(self, dhpe_metrics: DHPEMetrics, spot_price: float,
-                              sentiment_regime: MarketRegime, sentiment_confidence: float,
-                              bias_scores: Dict[str, float], liquidity_metrics: Dict[str, float],
-                              risk_level: RiskLevel, hedge_recommendations: List[HedgeRecommendation],
-                              portfolio_delta: float = 0) -> IntegratedSignal:
-        """
-        Complete integration of all agent outputs
-        
-        This is the main interface for getting integrated trading signals
-        """
-        
-        # Process each agent signal
-        dhpe_signal = self.process_dhpe_signal(dhpe_metrics, spot_price)
-        sentiment_signal = self.process_sentiment_signal(sentiment_regime, sentiment_confidence, bias_scores)
-        liquidity_signal = self.process_liquidity_signal(liquidity_metrics)
-        risk_signal = self.process_risk_signal(risk_level, hedge_recommendations, portfolio_delta)
-        
-        # Integrate into final signal
-        integrated = self.integrate_signals(dhpe_signal, sentiment_signal, liquidity_signal, risk_signal)
-        
-        # Store in history
-        self.signal_history.append(integrated)
-        
-        # Keep history limited
-        if len(self.signal_history) > 100:
-            self.signal_history = self.signal_history[-100:]
-        
-        logger.info(f"Integrated signal: {integrated.direction.value} "
-                   f"(strength: {integrated.strength.value}, conviction: {integrated.conviction_score:.3f})")
-        
-        return integrated
+            return 1.0  # Neutral if no risk
 
-def create_sample_integration() -> Tuple[Agent4SignalMixer, IntegratedSignal]:
-    """Create sample integration for testing"""
+class EnsembleMethod:
+    """Ensemble methods for signal mixing"""
     
-    # Initialize mixer
-    mixer = Agent4SignalMixer()
+    def __init__(self):
+        self.method_weights = {
+            'weighted_average': 0.4,
+            'majority_vote': 0.3,
+            'stacking': 0.2,
+            'dynamic_selection': 0.1
+        }
+        
+    def weighted_average_mixing(self, signals: List[AgentSignal]) -> Tuple[SignalType, float]:
+        """Weighted average of signal strengths"""
+        
+        if not signals:
+            return SignalType.HOLD, 0.0
+            
+        # Group by signal type
+        signal_groups = {}
+        for signal in signals:
+            if signal.signal_type not in signal_groups:
+                signal_groups[signal.signal_type] = []
+            signal_groups[signal.signal_type].append(signal)
+            
+        # Calculate weighted average for each signal type
+        signal_scores = {}
+        for sig_type, sig_list in signal_groups.items():
+            weights = [s.weight * s.confidence for s in sig_list]
+            strengths = [s.strength for s in sig_list]
+            
+            if sum(weights) > 0:
+                weighted_strength = np.average(strengths, weights=weights)
+                signal_scores[sig_type] = weighted_strength * (len(sig_list) / len(signals))
+            else:
+                signal_scores[sig_type] = 0.0
+                
+        # Return strongest signal
+        if signal_scores:
+            best_signal = max(signal_scores.items(), key=lambda x: x[1])
+            return best_signal[0], best_signal[1]
+        else:
+            return SignalType.HOLD, 0.0
+            
+    def majority_vote_mixing(self, signals: List[AgentSignal]) -> Tuple[SignalType, float]:
+        """Majority vote with confidence weighting"""
+        
+        if not signals:
+            return SignalType.HOLD, 0.0
+            
+        # Count votes weighted by confidence
+        vote_weights = {}
+        for signal in signals:
+            vote_weight = signal.confidence * signal.weight
+            
+            if signal.signal_type not in vote_weights:
+                vote_weights[signal.signal_type] = 0
+            vote_weights[signal.signal_type] += vote_weight
+            
+        if vote_weights:
+            total_weight = sum(vote_weights.values())
+            best_signal = max(vote_weights.items(), key=lambda x: x[1])
+            
+            return best_signal[0], best_signal[1] / total_weight if total_weight > 0 else 0.0
+        else:
+            return SignalType.HOLD, 0.0
+            
+    def stacking_mixing(self, signals: List[AgentSignal], 
+                       historical_data: Dict[str, Any] = None) -> Tuple[SignalType, float]:
+        """Meta-learning approach to signal mixing"""
+        
+        # Simplified stacking - would use trained model in production
+        if not signals:
+            return SignalType.HOLD, 0.0
+            
+        # Feature engineering
+        features = []
+        for signal in signals:
+            signal_features = [
+                signal.strength,
+                signal.confidence, 
+                signal.weight,
+                1.0 if signal.signal_type == SignalType.BUY else 0.0,
+                1.0 if signal.signal_type == SignalType.SELL else 0.0,
+                len(signal.supporting_data)
+            ]
+            features.extend(signal_features)
+            
+        # Pad features to fixed length
+        while len(features) < 24:  # 4 agents * 6 features
+            features.append(0.0)
+        features = features[:24]  # Truncate if too long
+        
+        # Simple meta-model (in production, would be trained ML model)
+        feature_array = np.array(features).reshape(1, -1)
+        
+        # Simplified decision logic
+        buy_score = sum(features[i] * features[i+1] * features[i+3] 
+                       for i in range(0, len(features), 6))
+        sell_score = sum(features[i] * features[i+1] * features[i+4] 
+                        for i in range(0, len(features), 6))
+        
+        if buy_score > sell_score and buy_score > 0.3:
+            return SignalType.BUY, min(1.0, buy_score)
+        elif sell_score > buy_score and sell_score > 0.3:
+            return SignalType.SELL, min(1.0, sell_score)
+        else:
+            return SignalType.HOLD, max(buy_score, sell_score)
+            
+    def dynamic_selection_mixing(self, signals: List[AgentSignal], 
+                               market_regime: str = "normal") -> Tuple[SignalType, float]:
+        """Dynamically select best agents based on market conditions"""
+        
+        if not signals:
+            return SignalType.HOLD, 0.0
+            
+        # Agent preferences by market regime
+        regime_preferences = {
+            "bull": {"dhpe": 0.8, "liquidity": 1.0, "sentiment": 1.2, "hedge": 0.6},
+            "bear": {"dhpe": 1.2, "liquidity": 0.8, "sentiment": 0.6, "hedge": 1.4},
+            "sideways": {"dhpe": 1.0, "liquidity": 1.2, "sentiment": 0.8, "hedge": 1.0},
+            "volatile": {"dhpe": 1.4, "liquidity": 0.6, "sentiment": 0.8, "hedge": 1.2},
+            "normal": {"dhpe": 1.0, "liquidity": 1.0, "sentiment": 1.0, "hedge": 1.0}
+        }
+        
+        preferences = regime_preferences.get(market_regime, regime_preferences["normal"])
+        
+        # Adjust signal weights based on regime
+        adjusted_signals = []
+        for signal in signals:
+            # Map agent names to preferences
+            agent_key = signal.agent_name.lower()
+            for pref_key in preferences:
+                if pref_key in agent_key:
+                    regime_multiplier = preferences[pref_key]
+                    adjusted_weight = signal.weight * regime_multiplier
+                    
+                    # Create new signal with adjusted weight
+                    adjusted_signal = AgentSignal(
+                        agent_id=signal.agent_id,
+                        agent_name=signal.agent_name,
+                        signal_type=signal.signal_type,
+                        strength=signal.strength,
+                        confidence=signal.confidence,
+                        timestamp=signal.timestamp,
+                        symbol=signal.symbol,
+                        reasoning=signal.reasoning,
+                        supporting_data=signal.supporting_data,
+                        weight=min(1.0, adjusted_weight)
+                    )
+                    adjusted_signals.append(adjusted_signal)
+                    break
+            else:
+                adjusted_signals.append(signal)  # Keep original if no match
+                
+        # Use weighted average on adjusted signals
+        return self.weighted_average_mixing(adjusted_signals)
+        
+    def mix_signals(self, signals: List[AgentSignal], 
+                   market_data: Dict[str, Any] = None) -> Tuple[SignalType, float]:
+        """Combine all ensemble methods"""
+        
+        if not signals:
+            return SignalType.HOLD, 0.0
+            
+        # Get results from each method
+        wa_signal, wa_strength = self.weighted_average_mixing(signals)
+        mv_signal, mv_strength = self.majority_vote_mixing(signals)
+        st_signal, st_strength = self.stacking_mixing(signals)
+        
+        # Determine market regime for dynamic selection
+        market_regime = "normal"
+        if market_data:
+            volatility = market_data.get('volatility', 0.20)
+            if volatility > 0.30:
+                market_regime = "volatile"
+            elif volatility < 0.10:
+                market_regime = "sideways"
+                
+        ds_signal, ds_strength = self.dynamic_selection_mixing(signals, market_regime)
+        
+        # Combine method results
+        method_results = [
+            (wa_signal, wa_strength, self.method_weights['weighted_average']),
+            (mv_signal, mv_strength, self.method_weights['majority_vote']),
+            (st_signal, st_strength, self.method_weights['stacking']),
+            (ds_signal, ds_strength, self.method_weights['dynamic_selection'])
+        ]
+        
+        # Group by signal type and weight
+        signal_scores = {}
+        for signal_type, strength, method_weight in method_results:
+            if signal_type not in signal_scores:
+                signal_scores[signal_type] = 0.0
+            signal_scores[signal_type] += strength * method_weight
+            
+        # Return best signal
+        if signal_scores:
+            best_signal = max(signal_scores.items(), key=lambda x: x[1])
+            return best_signal[0], min(1.0, best_signal[1])
+        else:
+            return SignalType.HOLD, 0.0
+
+class SignalQualityFilter:
+    """Filter and validate signal quality"""
     
-    # Sample DHPE metrics
-    dhpe_metrics = DHPEMetrics(
-        symbol="SPY",
-        timestamp=datetime.now(),
-        total_gamma_exposure=-150.5,
-        call_gamma_exposure=-80.2,
-        put_gamma_exposure=-70.3,
-        net_gamma_exposure=-150.5,
-        dealer_positioning=-0.75,  # Dealers short gamma
-        hedge_pressure_score=0.85,  # High pressure
-        max_pain_strike=430.0,
-        max_pain_value=25.5,
-        call_put_ratio=1.2,
-        volume_weighted_iv=0.18,
-        vanna_pressure=0.05,
-        charm_pressure=0.12
-    )
+    def __init__(self):
+        self.min_confidence = 0.1
+        self.max_age_hours = 24
+        self.min_strength = 0.05
+        
+    def filter_signals(self, signals: List[AgentSignal]) -> List[AgentSignal]:
+        """Filter signals based on quality criteria"""
+        
+        filtered_signals = []
+        now = datetime.now()
+        
+        for signal in signals:
+            # Age check
+            age_hours = (now - signal.timestamp).total_seconds() / 3600
+            if age_hours > self.max_age_hours:
+                logger.debug(f"Filtered out aged signal from {signal.agent_name}")
+                continue
+                
+            # Confidence check
+            if signal.confidence < self.min_confidence:
+                logger.debug(f"Filtered out low confidence signal from {signal.agent_name}")
+                continue
+                
+            # Strength check
+            if signal.strength < self.min_strength:
+                logger.debug(f"Filtered out weak signal from {signal.agent_name}")
+                continue
+                
+            # Data integrity check
+            if not signal.reasoning or len(signal.reasoning.strip()) == 0:
+                logger.debug(f"Filtered out signal with no reasoning from {signal.agent_name}")
+                continue
+                
+            filtered_signals.append(signal)
+            
+        return filtered_signals
+        
+    def detect_anomalous_signals(self, signals: List[AgentSignal]) -> List[AgentSignal]:
+        """Detect and flag anomalous signals"""
+        
+        if len(signals) < 2:
+            return signals
+            
+        # Calculate z-scores for strength and confidence
+        strengths = [s.strength for s in signals]
+        confidences = [s.confidence for s in signals]
+        
+        strength_mean = np.mean(strengths)
+        strength_std = np.std(strengths)
+        confidence_mean = np.mean(confidences)
+        confidence_std = np.std(confidences)
+        
+        non_anomalous = []
+        
+        for signal in signals:
+            # Z-score anomaly detection
+            if strength_std > 0:
+                strength_z = abs(signal.strength - strength_mean) / strength_std
+            else:
+                strength_z = 0
+                
+            if confidence_std > 0:
+                confidence_z = abs(signal.confidence - confidence_mean) / confidence_std
+            else:
+                confidence_z = 0
+                
+            # Flag if z-score > 2.5 (very unusual)
+            if strength_z > 2.5 or confidence_z > 2.5:
+                logger.warning(f"Anomalous signal detected from {signal.agent_name}: "
+                             f"strength_z={strength_z:.2f}, confidence_z={confidence_z:.2f}")
+                # Reduce weight but don't eliminate
+                signal.weight *= 0.5
+                
+            non_anomalous.append(signal)
+            
+        return non_anomalous
+
+class GnosisSignalMixer:
+    """Main Gnosis Signal Mixer - Agent 4"""
     
-    # Sample liquidity metrics
-    liquidity_metrics = {
-        'vwap_deviation': 0.02,  # 2% above VWAP
-        'volume_profile_strength': 0.8,
-        'aggressive_buy_ratio': 0.65  # More aggressive buying
+    def __init__(self):
+        self.signal_weights = SignalWeight()
+        self.conviction_calculator = ConvictionCalculator()
+        self.ensemble_method = EnsembleMethod()
+        self.quality_filter = SignalQualityFilter()
+        
+        self.signal_history = {}
+        self.performance_tracking = {}
+        
+        logger.info("Gnosis Signal Mixer initialized")
+        
+    async def mix_agent_signals(self, agent_signals: List[Dict[str, Any]], 
+                              market_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Main signal mixing function"""
+        
+        # Convert dictionaries to AgentSignal objects
+        signals = []
+        for signal_data in agent_signals:
+            try:
+                signal = AgentSignal(
+                    agent_id=signal_data.get('agent_id', ''),
+                    agent_name=signal_data.get('agent_name', ''),
+                    signal_type=SignalType(signal_data.get('signal_type', 'hold')),
+                    strength=signal_data.get('strength', 0.0),
+                    confidence=signal_data.get('confidence', 0.0),
+                    timestamp=datetime.fromisoformat(signal_data.get('timestamp', datetime.now().isoformat())),
+                    symbol=signal_data.get('symbol', ''),
+                    reasoning=signal_data.get('reasoning', ''),
+                    supporting_data=signal_data.get('supporting_data', {})
+                )
+                signals.append(signal)
+            except Exception as e:
+                logger.error(f"Error parsing signal: {e}")
+                continue
+                
+        return await self._process_signals(signals, market_data)
+        
+    async def _process_signals(self, signals: List[AgentSignal], 
+                             market_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Process and mix the signals"""
+        
+        if not signals:
+            return self._create_hold_signal(market_data.get('symbol', 'UNKNOWN'))
+            
+        # Filter signal quality
+        filtered_signals = self.quality_filter.filter_signals(signals)
+        filtered_signals = self.quality_filter.detect_anomalous_signals(filtered_signals)
+        
+        if not filtered_signals:
+            return self._create_hold_signal(signals[0].symbol)
+            
+        # Update signal weights based on performance
+        await self._update_signal_weights(filtered_signals)
+        
+        # Mix signals using ensemble methods
+        mixed_signal_type, signal_strength = self.ensemble_method.mix_signals(
+            filtered_signals, market_data
+        )
+        
+        # Calculate consensus level
+        consensus_level = self._calculate_consensus(filtered_signals, mixed_signal_type)
+        
+        # Create mixed signal
+        mixed_signal = MixedSignal(
+            symbol=filtered_signals[0].symbol,
+            signal_type=mixed_signal_type,
+            strength=signal_strength,
+            confidence=self._determine_confidence_level(signal_strength, consensus_level),
+            conviction_score=0.0,  # Will be calculated next
+            contributing_agents=[s.agent_name for s in filtered_signals],
+            consensus_level=consensus_level,
+            risk_reward_ratio=0.0  # Will be calculated next
+        )
+        
+        # Calculate conviction and risk/reward
+        mixed_signal.conviction_score = self.conviction_calculator.calculate_conviction(
+            filtered_signals, mixed_signal
+        )
+        mixed_signal.risk_reward_ratio = self.conviction_calculator.calculate_risk_reward_ratio(
+            filtered_signals, market_data
+        )
+        
+        # Determine execution priority
+        mixed_signal.execution_priority = self._determine_execution_priority(
+            mixed_signal, filtered_signals
+        )
+        
+        # Store supporting analysis
+        mixed_signal.supporting_analysis = self._compile_supporting_analysis(
+            filtered_signals, mixed_signal, market_data
+        )
+        
+        # Track signal for performance monitoring
+        self._track_signal(mixed_signal, filtered_signals)
+        
+        return self._format_output(mixed_signal, filtered_signals)
+        
+    async def _update_signal_weights(self, signals: List[AgentSignal]):
+        """Update agent weights based on recent performance"""
+        
+        for signal in signals:
+            agent_id = signal.agent_id
+            
+            # Get recent performance data (would be from database in production)
+            recent_signals = self.signal_history.get(agent_id, [])
+            
+            # Mock outcomes for example (in production, would track actual results)
+            mock_outcomes = [np.random.normal(0, 0.05) for _ in recent_signals]
+            
+            # Update weight
+            if recent_signals and len(recent_signals) >= 5:  # Minimum history needed
+                performance_weight = self.signal_weights.calculate_performance_weight(
+                    agent_id, recent_signals, mock_outcomes
+                )
+                diversification_weight = self.signal_weights.calculate_diversification_weight(
+                    agent_id, signals
+                )
+                
+                # Combine weights
+                final_weight = (performance_weight * 0.7) + (diversification_weight * 0.3)
+                signal.weight = final_weight
+                
+                logger.debug(f"Updated weight for {signal.agent_name}: {final_weight:.3f}")
+                
+    def _calculate_consensus(self, signals: List[AgentSignal], 
+                           final_signal_type: SignalType) -> float:
+        """Calculate consensus level among agents"""
+        
+        if not signals:
+            return 0.0
+            
+        # Count agreements weighted by agent importance
+        agreement_weight = 0.0
+        total_weight = 0.0
+        
+        for signal in signals:
+            if signal.signal_type == final_signal_type:
+                agreement_weight += signal.weight * signal.confidence
+            total_weight += signal.weight
+            
+        if total_weight > 0:
+            return agreement_weight / total_weight
+        else:
+            return 0.0
+            
+    def _determine_confidence_level(self, strength: float, consensus: float) -> ConfidenceLevel:
+        """Determine confidence level based on strength and consensus"""
+        
+        combined_score = (strength * 0.6) + (consensus * 0.4)
+        
+        if combined_score >= 0.80:
+            return ConfidenceLevel.VERY_HIGH
+        elif combined_score >= 0.65:
+            return ConfidenceLevel.HIGH
+        elif combined_score >= 0.45:
+            return ConfidenceLevel.MEDIUM
+        elif combined_score >= 0.25:
+            return ConfidenceLevel.LOW
+        else:
+            return ConfidenceLevel.VERY_LOW
+            
+    def _determine_execution_priority(self, mixed_signal: MixedSignal, 
+                                    signals: List[AgentSignal]) -> str:
+        """Determine execution priority for the mixed signal"""
+        
+        # High priority conditions
+        high_priority_conditions = [
+            mixed_signal.conviction_score > 0.75,
+            mixed_signal.confidence in [ConfidenceLevel.HIGH, ConfidenceLevel.VERY_HIGH],
+            mixed_signal.consensus_level > 0.80,
+            len(signals) >= 3,  # Multiple agents agree
+            mixed_signal.risk_reward_ratio > 2.0
+        ]
+        
+        # Medium priority conditions
+        medium_priority_conditions = [
+            mixed_signal.conviction_score > 0.50,
+            mixed_signal.confidence == ConfidenceLevel.MEDIUM,
+            mixed_signal.consensus_level > 0.60,
+            mixed_signal.risk_reward_ratio > 1.5
+        ]
+        
+        if sum(high_priority_conditions) >= 3:
+            return "high"
+        elif sum(medium_priority_conditions) >= 2:
+            return "medium"
+        else:
+            return "low"
+            
+    def _compile_supporting_analysis(self, signals: List[AgentSignal], 
+                                   mixed_signal: MixedSignal,
+                                   market_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Compile supporting analysis from all agents"""
+        
+        analysis = {
+            'agent_contributions': {},
+            'signal_distribution': {},
+            'key_factors': [],
+            'risk_assessment': {},
+            'market_context': {}
+        }
+        
+        # Agent contributions
+        for signal in signals:
+            analysis['agent_contributions'][signal.agent_name] = {
+                'signal_type': signal.signal_type.value,
+                'strength': signal.strength,
+                'confidence': signal.confidence,
+                'weight': signal.weight,
+                'reasoning': signal.reasoning,
+                'key_data': signal.supporting_data
+            }
+            
+        # Signal distribution
+        signal_types = [s.signal_type for s in signals]
+        for sig_type in set(signal_types):
+            count = signal_types.count(sig_type)
+            analysis['signal_distribution'][sig_type.value] = {
+                'count': count,
+                'percentage': count / len(signals) * 100
+            }
+            
+        # Key factors from all agents
+        all_factors = []
+        for signal in signals:
+            if 'key_factors' in signal.supporting_data:
+                all_factors.extend(signal.supporting_data['key_factors'])
+        analysis['key_factors'] = list(set(all_factors))  # Remove duplicates
+        
+        # Risk assessment
+        analysis['risk_assessment'] = {
+            'conviction_score': mixed_signal.conviction_score,
+            'consensus_level': mixed_signal.consensus_level,
+            'risk_reward_ratio': mixed_signal.risk_reward_ratio,
+            'execution_priority': mixed_signal.execution_priority
+        }
+        
+        # Market context
+        analysis['market_context'] = market_data
+        
+        return analysis
+        
+    def _track_signal(self, mixed_signal: MixedSignal, contributing_signals: List[AgentSignal]):
+        """Track signals for performance monitoring"""
+        
+        # Store in history for future weight updates
+        for signal in contributing_signals:
+            agent_id = signal.agent_id
+            if agent_id not in self.signal_history:
+                self.signal_history[agent_id] = []
+                
+            self.signal_history[agent_id].append(signal)
+            
+            # Keep only recent history (last 50 signals)
+            if len(self.signal_history[agent_id]) > 50:
+                self.signal_history[agent_id] = self.signal_history[agent_id][-50:]
+                
+    def _create_hold_signal(self, symbol: str) -> Dict[str, Any]:
+        """Create default HOLD signal when no valid signals available"""
+        
+        hold_signal = MixedSignal(
+            symbol=symbol,
+            signal_type=SignalType.HOLD,
+            strength=0.0,
+            confidence=ConfidenceLevel.LOW,
+            conviction_score=0.0,
+            contributing_agents=[],
+            consensus_level=0.0,
+            risk_reward_ratio=1.0,
+            execution_priority="low"
+        )
+        
+        return self._format_output(hold_signal, [])
+        
+    def _format_output(self, mixed_signal: MixedSignal, 
+                      contributing_signals: List[AgentSignal]) -> Dict[str, Any]:
+        """Format final output for Gnosis system"""
+        
+        return {
+            'agent': 'signal_mixer',
+            'timestamp': mixed_signal.timestamp.isoformat(),
+            'symbol': mixed_signal.symbol,
+            'mixed_signal': {
+                'type': mixed_signal.signal_type.value,
+                'strength': round(mixed_signal.strength, 4),
+                'confidence': mixed_signal.confidence.value,
+                'conviction_score': round(mixed_signal.conviction_score, 4),
+                'consensus_level': round(mixed_signal.consensus_level, 4),
+                'risk_reward_ratio': round(mixed_signal.risk_reward_ratio, 4),
+                'execution_priority': mixed_signal.execution_priority
+            },
+            'contributing_agents': mixed_signal.contributing_agents,
+            'signal_count': len(contributing_signals),
+            'supporting_analysis': mixed_signal.supporting_analysis,
+            'performance_metadata': {
+                'processing_time': 0.0,  # Would be actual processing time
+                'signals_filtered': 0,
+                'anomalies_detected': 0
+            }
+        }
+        
+    async def run_signal_mixing(self, gnosis_agent_outputs: List[Dict[str, Any]], 
+                              market_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Main entry point for Gnosis system integration"""
+        
+        start_time = datetime.now()
+        
+        # Extract signals from agent outputs
+        agent_signals = []
+        for agent_output in gnosis_agent_outputs:
+            try:
+                # Convert agent output to signal format
+                signal_data = {
+                    'agent_id': agent_output.get('agent', 'unknown'),
+                    'agent_name': agent_output.get('agent', 'Unknown Agent'),
+                    'signal_type': self._extract_signal_type(agent_output),
+                    'strength': agent_output.get('signal_strength', 0.0),
+                    'confidence': agent_output.get('confidence', 0.0),
+                    'timestamp': agent_output.get('timestamp', datetime.now().isoformat()),
+                    'symbol': market_data.get('symbol', 'UNKNOWN'),
+                    'reasoning': agent_output.get('reasoning', ''),
+                    'supporting_data': agent_output.get('analysis', {})
+                }
+                agent_signals.append(signal_data)
+                
+            except Exception as e:
+                logger.error(f"Error processing agent output: {e}")
+                continue
+                
+        # Mix the signals
+        result = await self.mix_agent_signals(agent_signals, market_data)
+        
+        # Add performance metadata
+        processing_time = (datetime.now() - start_time).total_seconds()
+        result['performance_metadata']['processing_time'] = processing_time
+        
+        logger.info(f"Signal mixing completed in {processing_time:.3f}s: "
+                   f"{result['mixed_signal']['type']} signal with "
+                   f"{result['mixed_signal']['strength']:.2f} strength")
+        
+        return result
+        
+    def _extract_signal_type(self, agent_output: Dict[str, Any]) -> str:
+        """Extract signal type from agent output"""
+        
+        # Look for explicit signal type
+        if 'signal_type' in agent_output:
+            return agent_output['signal_type']
+            
+        # Infer from signal strength and agent type
+        strength = agent_output.get('signal_strength', 0.5)
+        agent_name = agent_output.get('agent', '').lower()
+        
+        if 'hedge' in agent_name:
+            return 'hedge'  # Hedge agent primarily provides risk signals
+        elif strength > 0.6:
+            return 'buy'
+        elif strength < 0.4:
+            return 'sell' 
+        else:
+            return 'hold'
+
+# Example usage
+async def main():
+    """Example usage of Gnosis Signal Mixer"""
+    
+    # Initialize signal mixer
+    mixer = GnosisSignalMixer()
+    
+    # Example agent outputs (from DHPE, Liquidity, Sentiment, Hedge agents)
+    gnosis_agent_outputs = [
+        {
+            'agent': 'dhpe_engine',
+            'signal_strength': 0.75,
+            'confidence': 0.80,
+            'timestamp': datetime.now().isoformat(),
+            'reasoning': 'Strong call gamma suggests upward pressure',
+            'analysis': {
+                'gamma_exposure': 1500,
+                'call_put_ratio': 1.8,
+                'key_factors': ['high_gamma', 'bullish_flow']
+            }
+        },
+        {
+            'agent': 'liquidity_agent',
+            'signal_strength': 0.65,
+            'confidence': 0.70,
+            'timestamp': datetime.now().isoformat(),
+            'reasoning': 'Increasing bid volume and tightening spreads',
+            'analysis': {
+                'volume_profile': 'bullish',
+                'spread_trend': 'tightening',
+                'key_factors': ['volume_surge', 'tight_spreads']
+            }
+        },
+        {
+            'agent': 'sentiment_agent',
+            'signal_strength': 0.45,
+            'confidence': 0.60,
+            'timestamp': datetime.now().isoformat(),
+            'reasoning': 'Mixed sentiment with slight bearish bias',
+            'analysis': {
+                'regime': 'uncertainty',
+                'bias_score': -0.2,
+                'key_factors': ['mixed_signals', 'uncertainty']
+            }
+        },
+        {
+            'agent': 'hedge_agent',
+            'signal_strength': 0.30,
+            'confidence': 0.85,
+            'timestamp': datetime.now().isoformat(),
+            'reasoning': 'High risk metrics suggest caution',
+            'analysis': {
+                'var_95': 5000,
+                'risk_alerts': 2,
+                'key_factors': ['high_risk', 'defensive_positioning']
+            }
+        }
+    ]
+    
+    # Market data
+    market_data = {
+        'symbol': 'SPY',
+        'price': 452.50,
+        'volatility': 0.18,
+        'volume': 85000000
     }
     
-    # Sample bias scores
-    bias_scores = {
-        'herding': 0.7,
-        'anchoring': 0.4,
-        'recency': 0.6,
-        'confirmation': 0.5,
-        'loss_aversion': 0.3
-    }
+    # Run signal mixing
+    result = await mixer.run_signal_mixing(gnosis_agent_outputs, market_data)
     
-    # Get integrated signal
-    integrated = mixer.get_integrated_analysis(
-        dhpe_metrics=dhpe_metrics,
-        spot_price=432.50,
-        sentiment_regime=MarketRegime.BULL_MODERATE,
-        sentiment_confidence=0.78,
-        bias_scores=bias_scores,
-        liquidity_metrics=liquidity_metrics,
-        risk_level=RiskLevel.MODERATE,
-        hedge_recommendations=[],
-        portfolio_delta=0
-    )
+    print("=== Gnosis Signal Mixer Results ===")
+    print(f"Symbol: {result['symbol']}")
+    print(f"Mixed Signal: {result['mixed_signal']['type'].upper()}")
+    print(f"Strength: {result['mixed_signal']['strength']:.3f}")
+    print(f"Confidence: {result['mixed_signal']['confidence']}")
+    print(f"Conviction Score: {result['mixed_signal']['conviction_score']:.3f}")
+    print(f"Consensus Level: {result['mixed_signal']['consensus_level']:.3f}")
+    print(f"Risk/Reward Ratio: {result['mixed_signal']['risk_reward_ratio']:.2f}")
+    print(f"Execution Priority: {result['mixed_signal']['execution_priority'].upper()}")
     
-    return mixer, integrated
-
-def test_agent4_mixer():
-    """Test Agent 4 Signal Mixer"""
+    print(f"\nContributing Agents: {', '.join(result['contributing_agents'])}")
+    print(f"Processing Time: {result['performance_metadata']['processing_time']:.3f}s")
     
-    print("=== Testing Agent 4 Signal Mixer ===")
-    
-    mixer, integrated = create_sample_integration()
-    
-    print(f"\n🎯 Integrated Trading Signal:")
-    print(f"Direction: {integrated.direction.value}")
-    print(f"Strength: {integrated.strength.value}")
-    print(f"Confidence: {integrated.confidence:.3f}")
-    print(f"Strategy: {integrated.strategy_recommendation.value}")
-    print(f"Signal Agreement: {integrated.signal_agreement:.3f}")
-    print(f"Conviction Score: {integrated.conviction_score:.3f}")
-    print(f"Risk-Adjusted Confidence: {integrated.risk_adjusted_confidence:.3f}")
-    print(f"Position Size Modifier: {integrated.position_size_modifier:.2f}x")
-    
-    print(f"\n📊 Agent Contributions:")
-    for signal in [integrated.dhpe_signal, integrated.sentiment_signal, 
-                   integrated.liquidity_signal, integrated.risk_signal]:
-        print(f"{signal.agent_name:10} | {signal.direction.value:15} | "
-              f"Strength: {signal.signal_strength:+6.3f} | "
-              f"Conf: {signal.confidence:.3f} | "
-              f"Weight: {signal.weight:.2f}")
-        print(f"{' ':10} | Reasoning: {signal.reasoning}")
-        print()
-    
-    print(f"🚦 Entry Triggers:")
-    for trigger in integrated.entry_triggers:
-        print(f"  • {trigger}")
-    
-    print(f"\n🛑 Exit Triggers:")  
-    for trigger in integrated.exit_triggers:
-        print(f"  • {trigger}")
-    
-    print(f"\n✅ Agent 4 Signal Mixer test completed!")
-    
-    return mixer, integrated
+    print("\n=== Agent Contributions ===")
+    for agent, contrib in result['supporting_analysis']['agent_contributions'].items():
+        print(f"{agent}: {contrib['signal_type'].upper()} "
+              f"(strength={contrib['strength']:.2f}, "
+              f"confidence={contrib['confidence']:.2f})")
 
 if __name__ == "__main__":
-    test_agent4_mixer()
+    asyncio.run(main())
