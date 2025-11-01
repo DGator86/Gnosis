@@ -8,6 +8,25 @@ import sys
 import os
 from git_autopush import GitAutoPush
 
+def commit_agent4():
+    """Commit Agent 4 Signal Mixer"""
+    git = GitAutoPush()
+    
+    files = [
+        'agent4_signal_mixer.py',
+        'simple_integration_test.py'
+    ]
+    
+    description = "Signal integration engine that combines all agent outputs into trading decisions with conviction scoring"
+    
+    success = git.create_component_commit("Agent4-SignalMixer", files, description)
+    
+    if success:
+        print("🎉 Agent 4 committed and pushed!")
+        git.status()
+    else:
+        print("❌ Agent 4 commit failed")
+
 def commit_agent1():
     """Commit Agent 1 Hedge Engine"""
     git = GitAutoPush()
@@ -79,6 +98,32 @@ def commit_agent2():
     else:
         print("❌ Agent 2 commit failed")
 
+def commit_complete_system():
+    """Commit complete integrated system"""
+    git = GitAutoPush()
+    
+    files = [
+        'agent1_hedge.py',
+        'agent2_advanced_liquidity.py', 
+        'agent3_sentiment.py',
+        'agent4_signal_mixer.py',
+        'dhpe_engine.py',
+        'simple_integration_test.py',
+        'test_agent3_comprehensive.py',
+        'gnosis_system_demo.py',
+        'README.md'
+    ]
+    
+    description = "Complete 4-agent system integration with DHPE engine, all agents working together"
+    
+    success = git.create_component_commit("Complete-System", files, description)
+    
+    if success:
+        print("🎉 Complete system committed and pushed!")
+        git.status()
+    else:
+        print("❌ Complete system commit failed")
+
 def commit_autopush_system():
     """Commit the auto-push system itself"""
     git = GitAutoPush()
@@ -142,13 +187,16 @@ Gnosis Auto-Commit Commands:
   agent1        - Commit Agent 1 Hedge Engine
   agent2        - Commit Agent 2 Liquidity Analyzer
   agent3        - Commit Agent 3 Sentiment Interpreter  
+  agent4        - Commit Agent 4 Signal Mixer
   dhpe          - Commit DHPE Engine
+  complete      - Commit complete integrated system
   autopush      - Commit the auto-push system
   status        - Show git status
   setup <url>   - Setup remote repository
   
 Examples:
-  python auto_commit.py agent1
+  python auto_commit.py agent4
+  python auto_commit.py complete
   python auto_commit.py setup https://github.com/user/gnosis.git
   python auto_commit.py status
         """)
@@ -162,8 +210,12 @@ Examples:
         commit_agent2()
     elif command == "agent3":
         commit_agent3()
+    elif command == "agent4":
+        commit_agent4()
     elif command == "dhpe":
         commit_dhpe()
+    elif command == "complete":
+        commit_complete_system()
     elif command == "autopush":
         commit_autopush_system()
     elif command == "status":
