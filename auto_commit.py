@@ -8,6 +8,24 @@ import sys
 import os
 from git_autopush import GitAutoPush
 
+def commit_agent1():
+    """Commit Agent 1 Hedge Engine"""
+    git = GitAutoPush()
+    
+    files = [
+        'agent1_hedge.py'
+    ]
+    
+    description = "Real hedge calculations, position sizing, portfolio risk management, Greeks-based hedge recommendations"
+    
+    success = git.create_component_commit("Agent1-Hedge", files, description)
+    
+    if success:
+        print("🎉 Agent 1 committed and pushed!")
+        git.status()
+    else:
+        print("❌ Agent 1 commit failed")
+
 def commit_agent3():
     """Commit Agent 3 completion"""
     git = GitAutoPush()
@@ -121,15 +139,16 @@ if __name__ == "__main__":
         print("""
 Gnosis Auto-Commit Commands:
 
-  agent3        - Commit Agent 3 Sentiment Interpreter  
+  agent1        - Commit Agent 1 Hedge Engine
   agent2        - Commit Agent 2 Liquidity Analyzer
+  agent3        - Commit Agent 3 Sentiment Interpreter  
   dhpe          - Commit DHPE Engine
   autopush      - Commit the auto-push system
   status        - Show git status
   setup <url>   - Setup remote repository
   
 Examples:
-  python auto_commit.py agent3
+  python auto_commit.py agent1
   python auto_commit.py setup https://github.com/user/gnosis.git
   python auto_commit.py status
         """)
@@ -137,10 +156,12 @@ Examples:
     
     command = sys.argv[1].lower()
     
-    if command == "agent3":
-        commit_agent3()
+    if command == "agent1":
+        commit_agent1()
     elif command == "agent2":
         commit_agent2()
+    elif command == "agent3":
+        commit_agent3()
     elif command == "dhpe":
         commit_dhpe()
     elif command == "autopush":
